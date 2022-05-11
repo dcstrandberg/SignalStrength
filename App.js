@@ -3,8 +3,7 @@ import { FlatList, StyleSheet, Text, View, Button } from 'react-native';
 import { PermissionsAndroid } from 'react-native';
 import WifiManager from "react-native-wifi-reborn";
 //import { useState } from 'react/cjs/react.production.min';
-import { useState } from 'react';
-
+import { useState, useRef, useEffect } from 'react';
 
 const styles = StyleSheet.create({
   container: {
@@ -24,7 +23,21 @@ const styles = StyleSheet.create({
     fontSize: 18,
     justifyContent: 'center',
     fontWeight: 'bold',
-  }
+  },
+  isHere: {
+    fontSize: 24,
+    justifyContent: 'center',
+    textDecorationLine: 'underline',
+    color: 'red',
+  },
+  inThreshold: {
+    padding: 10,
+    fontSize: 18,
+    height: 44,
+    fontWeight: 'bold',
+    color: 'red',
+  },
+
 });
 
 
@@ -36,11 +49,45 @@ const styles = StyleSheet.create({
 
 const WifiList = () => {
 
-  blankNetworkList = [{'SSID': 'LOADING...', 'level': ""}]
-  const [networkList, setNetworkList] = useState(blankNetworkList);
-  const [currentMarker, setMarker] = useState(blankNetworkList);
+  // Use this to initialize the two networkList states
+  blankNetworkList = [{'SSID': 'LOADING...', 'level': "",}]
   
+  const [networkList, setNetworkList] = useState(blankNetworkList);
+  // This is a janky fix -- https://upmostly.com/tutorials/settimeout-in-react-components-using-hooks
+  // Doing this so we can reference the current state inside the core loop
+  const networkRef = useRef(networkList);
+  networkRef.current = networkList;
+
+
+  //Sometimes the getWifiList() promises seem to get backed up -- using this to see how many loops we're running
+  const [count, setCount] = useState(0);
+  const countRef = useRef(count);
+  countRef.current = count;
+    
+
+  
+  const [currentMarker, setMarker] = useState({
+    'id': '',
+    'networkList': blankNetworkList,
+    thresholdDict: {},
+    isHere: false,
+  });
+  const markerRef = useRef(currentMarker);
+  markerRef.current = currentMarker;
+
+  // Using this for UI / debugging purposes 
+  // keeping track of which wifi networks are within threshold and contributing to "HERE" result
+  const [inThresholdArray, setInThresholdArray] = useState([]);
+  const inThresholdRef = useRef(inThresholdArray);
+  inThresholdRef.current = inThresholdArray;
+
+  // The actual wifi request -- runs asyncronously
   const getWifiList = async () => {
+    
+    // The count state gets updated each loop, to help with debugging
+    console.log("Count: " + parseInt(countRef.current));
+    setCount( parseInt(countRef.current) + 1 );
+    
     const granted = await PermissionsAndroid.request(
       PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION,
       {
@@ -71,14 +118,23 @@ const WifiList = () => {
   }
 
   const createMarker = (networkList) => {
-    setMarker(networkList);
-    //return createMarkerThresholds(networkList);
-    return;
+    setMarker({
+      'id': Date.now(),
+      'networkList': networkList,
+      'thresholdDict': createMarkerThresholds(networkList),
+      'isHere': true,
+    });
+    return
   }
 
-  const createMarkerThresholds = (currentMarker) => {
-    sensitivityWeight = 0.1
-    thresholdDict = currentMarker.map( (networkDict) => {
+  const createMarkerThresholds = (markerNetworkList) => {
+    // This controls how wide the thresholds are 
+    // TODO: Work on tuning -- potentially some analysis is required to find the right value 
+    // Possibly a more advanced approach could be implemented (a range that varies more dramatically based on strength value)
+    const sensitivityWeight = 0.03;    
+    let thresholdDict = {};
+
+    markerNetworkList.map( (networkDict) => {
       thresholdDict[ networkDict.SSID ] = {
         // These are logically flipped because the value will be negative
         'min': networkDict.level * (1 + sensitivityWeight),
@@ -88,18 +144,48 @@ const WifiList = () => {
     return thresholdDict;
   }
 
+  // The function that determines whether we're in the same location as the marker
+  // Compare the thresholdDict from the currentMarker state to the networkList state
+  // Returns an array of two items:
+  // 0. Boolean indicating whether current location == marker location
+  // 1. Array of which networks returned within threshold values to result in 0th element
   const checkThresholds = (networkList, thresholdDict) => {
-    checkList = networkList.map( (networkDict) => {
-      (thresholdDict[ networkDict.SSID ].min <= networkDict.level && thresholdDict[ networkDict.SSID ].max >= networkDict.level);
+    let inThresholdArray = [];
+
+    checkList = networkList.map( (networkDict, idx) => {
+      // We need to handle networks that aren't in the threshold list
+      if ( !(Object.keys(thresholdDict).includes( networkDict.SSID )) ) {
+        return false;
+      } else {
+        const inThreshold = (thresholdDict[ networkDict.SSID ].min <= networkDict.level) && (thresholdDict[ networkDict.SSID ].max >= networkDict.level);
+        if (inThreshold) {
+          inThresholdArray.push(networkDict.SSID);
+        }
+        return inThreshold;
+      }
     });
-    numTrues = checkList.reduce((partialSum, a) => partialSum + a, 0);
-    return (numTrues == checkList.length);
+    numTrues = checkList.filter(x => x == true).length;
+    return [(numTrues >= 4), inThresholdArray];
   }
 
 
   const coreLoop = () => {
     getWifiList();
-    //checkThresholds(networkList, thresholdDict);
+    let isHere = false;
+    
+    // Now that we're in the coreLoop, which is called by setInterval, we need to use the state references
+    if (Object.keys(markerRef.current.thresholdDict).length > 0) {
+      let tempArray = checkThresholds(networkRef.current, markerRef.current.thresholdDict);
+      isHere = tempArray[0];
+      setInThresholdArray(tempArray[1]);
+    }
+
+    setMarker({
+      ...markerRef.current,
+      'isHere': isHere,
+    });  
+
+    return;
   }
 
   const nlToString = (networkList) => {
@@ -115,9 +201,15 @@ const WifiList = () => {
 
     return txt;
   }
-  //getWifiList();
 
-  setTimeout(coreLoop, 5000);
+  // When the component mounts start the core loop running on an interval
+  // Todo: identify ideal value for interval -- or portentially a more robust method??? 
+  useEffect(() => {
+    const interval = setInterval(() => {
+      coreLoop();
+    }, 3000);
+    return () => clearInterval(interval);
+  }, []);
 
   return (
     <View style={styles.container}>
@@ -126,7 +218,7 @@ const WifiList = () => {
       >
         Marked Location:
       </Text>
-      <Text style={styles.location}>{ nlToString(currentMarker) }</Text>
+      <Text style={styles.location}>{ nlToString(currentMarker.networkList) }</Text>
       <Text
         style={styles.title}
       >
@@ -134,8 +226,11 @@ const WifiList = () => {
       </Text>
       <FlatList
         data={ networkList }
-        renderItem={({item}) => <Text style={styles.item}>{item["SSID"]}: {item.level}</Text>}
+        renderItem={({item}) => <Text style={inThresholdArray.includes(item.SSID) ? styles.inThreshold : styles.item}>{item["SSID"]}: {item.level}</Text>}
       />
+      { currentMarker.isHere && 
+        <Text style={styles.isHere}>YOU ARE HERE</Text>
+      }
       <Button
         onPress={() => createMarker(networkList)}
         title="Set Marker Here"
